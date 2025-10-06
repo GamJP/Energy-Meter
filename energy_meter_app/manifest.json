@@ -1,0 +1,16 @@
+{
+  "name": "Wireless Energy Meter",
+  "short_name": "EnergyMeter",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#6ab744",
+  "theme_color": "#6ab744",
+  "icons": [
+    {
+      "src": "Logotipo_UIS.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    }
+  ]
+}
+

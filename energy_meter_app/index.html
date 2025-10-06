@@ -1,0 +1,34 @@
+<main style="display: flex; gap: 20px; padding: 20px;">
+  <!-- Sidebar guía WiFi -->
+  <div class="sidebar" style="width: 250px; background-color: #e0f7d4; padding: 15px; border-radius: 8px;">
+    <h2>Guía WiFi ESP32</h2>
+    <p>1. Encienda su ESP32 y espere a que la red aparezca en su dispositivo.</p>
+    <p>2. Conéctese a la red WiFi:</p>
+    <p>SSID: <span class="ssid" style="font-weight:bold; color:#6ab744;">ESP32_Medidor</span></p>
+    <p>Contraseña: <span class="password" style="font-weight:bold; color:#6ab744;">12345678</span></p>
+    <p>3. Abra la aplicación web para visualizar los datos.</p>
+  </div>
+
+  <!-- Contenido principal existente -->
+  <div class="content" style="flex:1;">
+    <section class="data-display">
+      <div class="data-card">
+        <h3>Tensión RMS</h3>
+        <p id="voltage">0.000 V</p>
+      </div>
+      <div class="data-card">
+        <h3>Corriente RMS</h3>
+        <p id="current">0.000 A</p>
+      </div>
+    </section>
+
+    <section class="chart-section">
+      <canvas id="dataChart"></canvas>
+    </section>
+
+    <section class="controls">
+      <button id="requestBtn" disabled>Solicitar Datos</button>
+      <button id="clearBtn">Limpiar</button>
+    </section>
+  </div>
+</main>
