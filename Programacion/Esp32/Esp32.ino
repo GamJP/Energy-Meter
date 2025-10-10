@@ -1,10 +1,3 @@
-/*
-  Medidor de Energía Inalámbrico – ESP32 + ADC externo (ADS124x/ADS1243)
-  - Lee Vout del acondicionamiento por SPI desde el ADC externo
-  - Convierte a corriente con: I = (Vout - 1.65)*100/16
-  - Guarda últimos 100 valores y los entrega por WebSocket (puerto 81) cuando el cliente envía "REQUEST_DATA"
-*/
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebSocketsServer.h>
@@ -96,32 +89,51 @@ void setup() {
 // =========================
 // --- LOOP ---
 void loop() {
-  static uint32_t t0 = 0;
+  static uint32_t t_sample = 0;
+  static uint32_t t_window = 0;
+  static const uint16_t N_SAMPLES = 500; // 500 muestras ≈ 0.5s si SAMPLE_MS=1ms
+
+  static float sumV2 = 0, sumI2 = 0;
+  static uint16_t count = 0;
+
   webSocket.loop();
 
-  if (millis() - t0 >= SAMPLE_MS) {
-    t0 = millis();
+  // muestreo a alta frecuencia (1 ms → 1 kHz)
+  if (millis() - t_sample >= 1) {
+    t_sample = millis();
 
-    // 1) Lee Vout (en voltios) desde el ADC externo
-    float vout = adcReadVoltage_once();  // 0..Vref (esperado alrededor de 1.65 V +/- señal)
-
-    // 2) Convierte a corriente con tu fórmula
+    // 1. Lectura instantánea del ADC
+    float vout = adcReadVoltage_once();
     float current = ((vout - ADC_MID) * CURR_NUM) / CURR_DEN;
 
-    // 3) (Opcional) Si también mides tensión RMS de red en otro canal,
-    //    léela aquí y colócala como "Vrms". De momento, almacenamos sólo el Vout mostrado en UI:
-    float Vrms_display = vout; // placeholder; reemplaza por tu Vrms real si la tienes
+    // 2. Acumulación para RMS
+    sumV2 += vout * vout;
+    sumI2 += current * current;
+    count++;
 
-    // 4) Guarda en el buffer circular
-    ringBuf[ringIdx] = { Vrms_display, current };
-    ringIdx = (ringIdx + 1) % BUF_N;
-    if (ringIdx == 0) filled = true;
+    // 3. Cada N_SAMPLES calcular RMS
+    if (count >= N_SAMPLES) {
+      float Vrms = sqrt(sumV2 / count);
+      float Irms = sqrt(sumI2 / count);
 
-    // 5) Parpadeo LED de vida
-    digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
+      // Reinicia acumuladores
+      sumV2 = 0;
+      sumI2 = 0;
+      count = 0;
+
+      // Guarda los RMS en buffer
+      ringBuf[ringIdx] = { Vrms, Irms };
+      ringIdx = (ringIdx + 1) % BUF_N;
+      if (ringIdx == 0) filled = true;
+
+      // LED parpadeo
+      digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
+
+      Serial.printf("Vrms=%.3f V, Irms=%.3f A\n", Vrms, Irms);
+    }
   }
 
-  // Si el cliente pidió datos, envía el JSON
+  // 4. Envía datos si la app lo pide
   if (dataRequested) {
     sendBufferAsJson();
     dataRequested = false;
@@ -170,11 +182,6 @@ void adcBegin() {
   SPI.transfer(ADC_CMD_RESET);
   digitalWrite(PIN_ADC_CS, HIGH);
   delay(5);
-
-  // NOTA:
-  // - Si tu ADC requiere escribir registros (ganancia, selección de canal, modo, etc.),
-  //   agrégalo aquí con comandos WREG específicos del ADS1243.
-  // - Este ejemplo asume canal ya configurado en hardware para medir Vout con offset 1.65 V.
 }
 
 // =========================
@@ -210,14 +217,8 @@ float adcReadVoltage_once() {
   uint32_t raw24 = (b1 << 16) | (b2 << 8) | (b3);
 
   // Conversión a voltios:
-  // Si el ADC está en modo unipolar 0..Vref mapeado linealmente:
   const float denom = (float)( (1UL << ADC_BITS) - 1UL );  // 2^24 - 1
   float v = ( (float)raw24 / denom ) * ADC_VREF;
-
-  // Si tú configuras el ADC en bipolar y quisieras tratarlo como signed:
-  //  int32_t s = (raw24 & 0x800000) ? (int32_t)(raw24 | 0xFF000000) : (int32_t)raw24;
-  //  float v = ( (float)s / (float)(1 << 23) ) * (ADC_VREF); // ±Vref a fondo de escala
-  //  v = 0.5f*ADC_VREF + 0.5f*v; // llevarlo a [0..Vref] si tu etapa lo espera así (no usual aquí)
 
   return v;
 }
