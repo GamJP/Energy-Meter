@@ -1,197 +1,223 @@
 /*
-  Proyecto: Medidor de Energía Eléctrica Inalámbrico
-  Archivo: energy_meter_esp32.ino
-  Autor: Juan Pablo Gamboa Durán
-  Descripción:
-  Firmware para el ESP32 que adquiere tensión y corriente RMS,
-  las almacena en memoria y las transmite vía WebSocket al
-  aplicativo web cuando este lo solicita.
+  Medidor de Energía Inalámbrico – ESP32 + ADC externo (ADS124x/ADS1243)
+  - Lee Vout del acondicionamiento por SPI desde el ADC externo
+  - Convierte a corriente con: I = (Vout - 1.65)*100/16
+  - Guarda últimos 100 valores y los entrega por WebSocket (puerto 81) cuando el cliente envía "REQUEST_DATA"
 */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebSocketsServer.h>
 #include <SPI.h>
-#include <math.h>
 
 // =========================
-// === PARÁMETROS DEL ADC ===
+// --- CONFIGURACIÓN WIFI --
+#define AP_SSID "EnergyMeter"
+#define AP_PASS ""                // sin clave; pon una si lo deseas
+const IPAddress AP_IP(192,168,4,1);
+const IPAddress AP_GATE(192,168,4,1);
+const IPAddress AP_MASK(255,255,255,0);
+
 // =========================
-#define NUM_VALUES      100
-#define SAMPLE_INTERVAL 1000   // 1 segundo
-#define ADC_VREF        3.3
-#define ADC_RESOLUTION  8388608.0
+// --- PINES (ajusta a tu PCB) ---
+#define PIN_SPI_SCLK   18
+#define PIN_SPI_MISO   19
+#define PIN_SPI_MOSI   23
+#define PIN_ADC_CS      5
+#define PIN_ADC_DRDY   27
+#define PIN_STATUS_LED  2
 
-// Pines del ADC y SPI
-#define CS_PIN    5
-#define DRDY_PIN  32
-#define SCLK_PIN  18
-#define MISO_PIN  19
-#define MOSI_PIN  23
+// =========================
+// --- ADC / ESCALA ---
+static const float ADC_VREF      = 3.300f;  // Vref del ADC (ajústalo si usas 2.5 V, etc.)
+static const float ADC_MID       = 1.650f;  // Offset de media (1.65 V)
+static const float CURR_NUM      = 100.0f;  // numerador de tu factor
+static const float CURR_DEN      = 16.0f;   // denominador de tu factor
+static const uint8_t ADC_BITS    = 24;      // ADS1243: 24-bit
+static const bool    ADC_BIPOLAR = false;   // medimos 0..Vref (tenemos offset de 1.65 V en analógico)
+static const uint8_t ADC_CMD_RESET = 0x06;  // Reset command (ADS124x)
+static const uint8_t ADC_CMD_RDATA = 0x12;  // Read Data command (ADS124x)
 
-// Pines de control y alimentación
-#define POWER_CTRL  12
-#define STATUS_LED  2
+// =========================
+// --- TIEMPOS ---
+static const uint32_t SAMPLE_MS = 1000; // 1 muestra por segundo (requisito)
 
-// ==========================
-// === CONFIGURACIÓN Wi-Fi ===
-// ==========================
-const char* ssid = "EnergyMeter_AP";
-const char* password = "12345678";
-IPAddress local_ip(192, 168, 4, 1);
-IPAddress gateway(192, 168, 4, 1);
-IPAddress subnet(255, 255, 255, 0);
-
+// =========================
+// --- WEBSOCKET ---
 WebSocketsServer webSocket(81);
 
-// ==========================
-// === VARIABLES GLOBALES ===
-// ==========================
-float voltageBuffer[NUM_VALUES];
-float currentBuffer[NUM_VALUES];
-int bufferIndex = 0;
-unsigned long lastSampleTime = 0;
-bool dataRequested = false;
+// =========================
+// --- BUFFER DE 100 MUESTRAS ---
+struct Sample { float V; float I; };
+static const size_t BUF_N = 100;
+Sample ringBuf[BUF_N];
+size_t  ringIdx = 0;
+bool    filled  = false;
+volatile bool dataRequested = false;
 
-// ==========================
-// === DECLARACIÓN FUNCIONES ===
-// ==========================
-float readADS1242Voltage();
-float readADS1242Current();
-void storeMeasurements(float voltage, float current);
-void sendStoredData();
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length);
+// =========================
+// --- PROTOS ---
+void wsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+void sendBufferAsJson();
+bool  adcWaitDRDY(uint32_t timeout_ms);
+void  adcBegin();
+float adcReadVoltage_once();
 
-// ==========================
-// === CONFIGURACIÓN INICIAL ===
-// ==========================
+// =========================
+// --- SETUP ---
 void setup() {
-  Serial.begin(115200);
-  SPI.begin(SCLK_PIN, MISO_PIN, MOSI_PIN);
+  pinMode(PIN_STATUS_LED, OUTPUT);
+  digitalWrite(PIN_STATUS_LED, LOW);
 
-  pinMode(CS_PIN, OUTPUT);
-  pinMode(DRDY_PIN, INPUT);
-  pinMode(POWER_CTRL, OUTPUT);
-  pinMode(STATUS_LED, OUTPUT);
+  // SPI
+  pinMode(PIN_ADC_CS, OUTPUT);
+  digitalWrite(PIN_ADC_CS, HIGH);
+  pinMode(PIN_ADC_DRDY, INPUT);
 
-  digitalWrite(CS_PIN, HIGH);
-  digitalWrite(POWER_CTRL, HIGH);
-  digitalWrite(STATUS_LED, LOW);
+  SPI.begin(PIN_SPI_SCLK, PIN_SPI_MISO, PIN_SPI_MOSI);
 
-  // Crear red Wi-Fi propia (modo Access Point)
+  // Inicia ADC
+  adcBegin();
+
+  // SoftAP para que el front-end se conecte a 192.168.4.1:81
   WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(local_ip, gateway, subnet);
-  WiFi.softAP(ssid, password);
-  Serial.println("====================================");
-  Serial.println("Red Wi-Fi creada exitosamente!");
-  Serial.print("Nombre de red (SSID): ");
-  Serial.println(ssid);
-  Serial.print("Contraseña: ");
-  Serial.println(password);
-  Serial.print("IP del ESP32: ");
-  Serial.println(WiFi.softAPIP());
-  Serial.println("====================================");
+  WiFi.softAPConfig(AP_IP, AP_GATE, AP_MASK);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(100);
 
-  // Inicializar servidor WebSocket
+  // WebSocket
   webSocket.begin();
-  webSocket.onEvent(webSocketEvent);
+  webSocket.onEvent(wsEvent);
 
-  Serial.println("Sistema inicializado correctamente.");
+  Serial.begin(115200);
+  Serial.println("\nESP32 listo. AP en 192.168.4.1, WS en :81");
 }
 
-// ==========================
-// === BUCLE PRINCIPAL ===
-// ==========================
+// =========================
+// --- LOOP ---
 void loop() {
+  static uint32_t t0 = 0;
   webSocket.loop();
 
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastSampleTime >= SAMPLE_INTERVAL) {
-    lastSampleTime = currentMillis;
+  if (millis() - t0 >= SAMPLE_MS) {
+    t0 = millis();
 
-    if (digitalRead(DRDY_PIN) == LOW) {
-      float vRMS = readADS1242Voltage();
-      float iRMS = readADS1242Current();
+    // 1) Lee Vout (en voltios) desde el ADC externo
+    float vout = adcReadVoltage_once();  // 0..Vref (esperado alrededor de 1.65 V +/- señal)
 
-      storeMeasurements(vRMS, iRMS);
-      digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+    // 2) Convierte a corriente con tu fórmula
+    float current = ((vout - ADC_MID) * CURR_NUM) / CURR_DEN;
 
-      Serial.printf("V: %.3f V | I: %.3f A\n", vRMS, iRMS);
-    }
+    // 3) (Opcional) Si también mides tensión RMS de red en otro canal,
+    //    léela aquí y colócala como "Vrms". De momento, almacenamos sólo el Vout mostrado en UI:
+    float Vrms_display = vout; // placeholder; reemplaza por tu Vrms real si la tienes
+
+    // 4) Guarda en el buffer circular
+    ringBuf[ringIdx] = { Vrms_display, current };
+    ringIdx = (ringIdx + 1) % BUF_N;
+    if (ringIdx == 0) filled = true;
+
+    // 5) Parpadeo LED de vida
+    digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
   }
 
+  // Si el cliente pidió datos, envía el JSON
   if (dataRequested) {
-    sendStoredData();
+    sendBufferAsJson();
     dataRequested = false;
   }
 }
 
-// ==========================
-// === LECTURA DE ADC ===
-// ==========================
-float readADS1242Voltage() {
-  digitalWrite(CS_PIN, LOW);
-  delayMicroseconds(5);
-  uint8_t msb = SPI.transfer(0x00);
-  uint8_t mid = SPI.transfer(0x00);
-  uint8_t lsb = SPI.transfer(0x00);
-  digitalWrite(CS_PIN, HIGH);
-
-  int32_t raw = ((int32_t)msb << 16) | ((int32_t)mid << 8) | lsb;
-  if (raw & 0x800000) raw |= 0xFF000000;
-  float voltage = (raw * ADC_VREF / ADC_RESOLUTION);
-  return fabs(voltage) * 0.707; // Conversión RMS
-}
-
-float readADS1242Current() {
-  digitalWrite(CS_PIN, LOW);
-  delayMicroseconds(5);
-  uint8_t msb = SPI.transfer(0x00);
-  uint8_t mid = SPI.transfer(0x00);
-  uint8_t lsb = SPI.transfer(0x00);
-  digitalWrite(CS_PIN, HIGH);
-
-  int32_t raw = ((int32_t)msb << 16) | ((int32_t)mid << 8) | lsb;
-  if (raw & 0x800000) raw |= 0xFF000000;
-  float current = (raw * ADC_VREF / ADC_RESOLUTION) / 0.01; // 0.01Ω shunt
-  return fabs(current) * 0.707; // Conversión RMS
-}
-
-// ==========================
-// === ALMACENAMIENTO ===
-// ==========================
-void storeMeasurements(float voltage, float current) {
-  voltageBuffer[bufferIndex] = voltage;
-  currentBuffer[bufferIndex] = current;
-  bufferIndex = (bufferIndex + 1) % NUM_VALUES;
-}
-
-// ==========================
-// === ENVÍO DE DATOS ===
-// ==========================
-void sendStoredData() {
-  String json = "[";
-  for (int i = 0; i < NUM_VALUES; i++) {
-    json += "{\"V\":" + String(voltageBuffer[i], 3) +
-            ",\"I\":" + String(currentBuffer[i], 3) + "}";
-    if (i < NUM_VALUES - 1) json += ",";
-  }
-  json += "]";
-  webSocket.broadcastTXT(json);
-  Serial.println("Datos enviados al cliente.");
-}
-
-// ==========================
-// === EVENTOS WEBSOCKET ===
-// ==========================
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+// =========================
+// --- WEBSOCKET HANDLER ---
+void wsEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
   if (type == WStype_CONNECTED) {
-    Serial.println("Cliente conectado.");
-  } 
-  else if (type == WStype_TEXT) {
-    String command = String((char *)payload);
-    if (command == "REQUEST_DATA") {
+    Serial.printf("WS: cliente #%u conectado\n", num);
+  } else if (type == WStype_TEXT) {
+    String cmd = String((char*)payload, length);
+    if (cmd == "REQUEST_DATA") {
       dataRequested = true;
     }
   }
+}
+
+// =========================
+// --- ENVÍO JSON (sin ArduinoJson) ---
+void sendBufferAsJson() {
+  String json = "[";
+  size_t count = filled ? BUF_N : ringIdx;
+  // Empezamos por la muestra más vieja para que queden ordenadas en el tiempo
+  size_t start = filled ? ringIdx : 0;
+  for (size_t k = 0; k < count; ++k) {
+    size_t idx = (start + k) % BUF_N;
+    // La UI espera {V:..., I:...}
+    json += "{\"V\":";
+    json += String(ringBuf[idx].V, 6);
+    json += ",\"I\":";
+    json += String(ringBuf[idx].I, 6);
+    json += "}";
+    if (k + 1 < count) json += ",";
+  }
+  json += "]";
+  webSocket.broadcastTXT(json);
+}
+
+// =========================
+// --- INICIALIZACIÓN DEL ADC ---
+void adcBegin() {
+  // Pulso de RESET al ADC
+  digitalWrite(PIN_ADC_CS, LOW);
+  SPI.transfer(ADC_CMD_RESET);
+  digitalWrite(PIN_ADC_CS, HIGH);
+  delay(5);
+
+  // NOTA:
+  // - Si tu ADC requiere escribir registros (ganancia, selección de canal, modo, etc.),
+  //   agrégalo aquí con comandos WREG específicos del ADS1243.
+  // - Este ejemplo asume canal ya configurado en hardware para medir Vout con offset 1.65 V.
+}
+
+// =========================
+// --- ESPERA DRDY ===
+bool adcWaitDRDY(uint32_t timeout_ms) {
+  uint32_t t0 = millis();
+  while (digitalRead(PIN_ADC_DRDY) != LOW) {
+    if (millis() - t0 > timeout_ms) return false;
+    delayMicroseconds(50);
+  }
+  return true;
+}
+
+// =========================
+// --- LECTURA ÚNICA DEL ADC EN VOLTIOS ---
+float adcReadVoltage_once() {
+  // Espera dato listo
+  if (!adcWaitDRDY(100)) {
+    // Si no hay dato listo a tiempo, devuelve la última estimación cerca del offset
+    return ADC_MID;
+  }
+
+  // En ADS124x, RDATA (0x12) seguido de la lectura de 3 bytes (24-bit)
+  digitalWrite(PIN_ADC_CS, LOW);
+  SPI.transfer(ADC_CMD_RDATA);
+
+  uint32_t b1 = SPI.transfer(0x00);
+  uint32_t b2 = SPI.transfer(0x00);
+  uint32_t b3 = SPI.transfer(0x00);
+  digitalWrite(PIN_ADC_CS, HIGH);
+
+  // 24-bit raw
+  uint32_t raw24 = (b1 << 16) | (b2 << 8) | (b3);
+
+  // Conversión a voltios:
+  // Si el ADC está en modo unipolar 0..Vref mapeado linealmente:
+  const float denom = (float)( (1UL << ADC_BITS) - 1UL );  // 2^24 - 1
+  float v = ( (float)raw24 / denom ) * ADC_VREF;
+
+  // Si tú configuras el ADC en bipolar y quisieras tratarlo como signed:
+  //  int32_t s = (raw24 & 0x800000) ? (int32_t)(raw24 | 0xFF000000) : (int32_t)raw24;
+  //  float v = ( (float)s / (float)(1 << 23) ) * (ADC_VREF); // ±Vref a fondo de escala
+  //  v = 0.5f*ADC_VREF + 0.5f*v; // llevarlo a [0..Vref] si tu etapa lo espera así (no usual aquí)
+
+  return v;
 }
